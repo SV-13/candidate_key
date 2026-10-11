@@ -20,10 +20,19 @@ from pymongo import MongoClient
 
 load_dotenv()
 
-client = MongoClient(os.getenv("MONGO_URI", "mongodb://localhost:27017"))
+
+client = MongoClient(
+    os.getenv("MONGO_URI", "mongodb://localhost:27017"),
+    tz_aware=True,
+)
+
 db = client[os.getenv("MONGO_DB", "attendance_db")]
 
 IST = timezone(timedelta(hours=5, minutes=30))
+
+MIN_EPOCH_MS = 100_000_000_000
+MAX_EPOCH_MS = 4_102_444_800_000
+EPOCH_UTC = datetime(1970, 1, 1, tzinfo=timezone.utc)
 
 app = FastAPI(title="Employee Attendance & Analytics API", version="2.0.0")
 
@@ -31,6 +40,31 @@ app = FastAPI(title="Employee Attendance & Analytics API", version="2.0.0")
 # --------------------------------------------------------------------------- #
 # Helpers
 # --------------------------------------------------------------------------- #
+
+
+def from_epoch_ms(value: int) -> datetime:
+    """Convert a strict epoch-millisecond integer to whole-second UTC."""
+    if type(value) is not int:
+        raise ValueError("Timestamp must be an integer in epoch milliseconds")
+
+    if not MIN_EPOCH_MS <= value <= MAX_EPOCH_MS:
+        raise ValueError("Timestamp is outside the permitted range")
+
+    whole_seconds = value // 1000
+
+    return EPOCH_UTC + timedelta(seconds=whole_seconds)
+
+
+def to_epoch_ms(value: datetime) -> int:
+    """Convert an aware datetime to whole-second epoch milliseconds."""
+    if value.tzinfo is None or value.utcoffset() is None:
+        raise ValueError("Datetime must be timezone-aware")
+
+    normalized = truncate_to_seconds(value).astimezone(timezone.utc)
+    elapsed = normalized - EPOCH_UTC
+
+    total_seconds = elapsed.days * 86_400 + elapsed.seconds
+    return total_seconds * 1000
 
 
 def truncate_to_seconds(value: datetime) -> datetime:
@@ -93,9 +127,6 @@ def compute_late_minutes(
     punch_in: datetime,
     shift_start: datetime,
 ) -> int:
-    """Return late minutes using the strict 10-minute grace period."""
-    punch_in = truncate_to_seconds(punch_in)
-    shift_start = truncate_to_seconds(shift_start)
 
     elapsed_seconds = int((punch_in - shift_start).total_seconds())
 
@@ -109,9 +140,6 @@ def compute_work_hours(
     punch_in: datetime,
     punch_out: datetime,
 ) -> Decimal:
-    """Calculate work hours, rounded to 2 decimal places using half-up."""
-    punch_in = truncate_to_seconds(punch_in)
-    punch_out = truncate_to_seconds(punch_out)
 
     duration = punch_out - punch_in
     elapsed_seconds = duration.days * 86400 + duration.seconds
@@ -133,9 +161,6 @@ def compute_overtime(
     punch_out: datetime,
     shift_end: datetime,
 ) -> int:
-    """Return overtime minutes only when at least 30 whole minutes elapsed."""
-    punch_out = truncate_to_seconds(punch_out)
-    shift_end = truncate_to_seconds(shift_end)
 
     elapsed_seconds = int((punch_out - shift_end).total_seconds())
 
@@ -182,7 +207,7 @@ def create_employee(body: EmployeeIn):
     if db.employees.find_one({"emp_code": body.emp_code}):
         raise HTTPException(409, "emp_code already exists")
     doc = body.model_dump()
-    doc["created_at"] = datetime.now()
+    doc["created_at"] = datetime.now(timezone.utc)
     db.employees.insert_one(doc)
     doc.pop("_id", None)
     return doc
@@ -202,7 +227,7 @@ def list_employees(department: Optional[str] = None, page: int = 1, page_size: i
 @app.post("/attendance/punch-in", status_code=201)
 def punch_in(body: PunchInIn):
     emp = db.employees.find_one({"emp_code": body.emp_code})
-    ts = datetime.fromtimestamp(body.punched_at / 1000) if body.punched_at else datetime.now()
+    ts = datetime.fromtimestamp(body.punched_at / 1000) if body.punched_at else datetime.now(timezone.utc)
     d = ts.date().isoformat()
     if db.attendance_logs.find_one({"emp_code": body.emp_code, "date": d}):
         raise HTTPException(409, "already punched in for this date")

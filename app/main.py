@@ -9,8 +9,9 @@ works, but nobody has reviewed it. Read PROBLEM_STATEMENT.docx for what is expec
 openapi.yaml for the contract and DATA_MODEL.md for what is stored in MongoDB.
 """
 import os
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from typing import Optional
+from decimal import Decimal, ROUND_HALF_UP
 
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException
@@ -30,21 +31,123 @@ app = FastAPI(title="Employee Attendance & Analytics API", version="2.0.0")
 # --------------------------------------------------------------------------- #
 # Helpers
 # --------------------------------------------------------------------------- #
-def compute_late_minutes(punch_in: datetime, shift_start: str) -> int:
-    h, m = map(int, shift_start.split(":"))
-    start = punch_in.replace(hour=h, minute=m, second=0, microsecond=0)
-    minutes = int((punch_in - start).total_seconds() / 60)
-    return minutes if minutes > 10 else 0
 
 
-def compute_work_hours(punch_in: datetime, punch_out: datetime) -> float:
-    return round((punch_out - punch_in).total_seconds() / 3600, 2)
+def truncate_to_seconds(value: datetime) -> datetime:
+    """Normalize an aware datetime to UTC and discard microseconds."""
+    if value.tzinfo is None or value.utcoffset() is None:
+        raise ValueError("Datetime must be timezone-aware")
+
+    return value.astimezone(timezone.utc).replace(microsecond=0)
+
+def compute_attendance_date(
+    punch_in: datetime,
+    shift_start: str,
+    shift_end: str,
+) -> date:
+    """Return the IST attendance date, accounting for overnight shifts."""
+    if punch_in.tzinfo is None or punch_in.utcoffset() is None:
+        raise ValueError("Datetime must be timezone-aware")
+
+    # Convert the instant to IST before determining its calendar date.
+    local_punch_in = punch_in.astimezone(IST)
+    attendance_date = local_punch_in.date()
+
+    # If the shift crosses midnight, an instant earlier than shift_end
+    # belongs to the shift that started on the previous calendar day.
+    if shift_end <= shift_start:
+        shift_end_time = datetime.strptime(shift_end, "%H:%M").time()
+
+        if local_punch_in.time() < shift_end_time:
+            attendance_date -= timedelta(days=1)
+
+    return attendance_date
+
+def get_shift_bounds(
+    attendance_date: date,
+    shift_start: str,
+    shift_end: str,
+) -> tuple[datetime, datetime]:
+    """Return shift start and end as timezone-aware UTC datetimes."""
+
+    start_time = datetime.strptime(shift_start, "%H:%M").time()
+    end_time = datetime.strptime(shift_end, "%H:%M").time()
+
+    # Overnight shifts end on the following calendar day.
+    end_date = (
+        attendance_date + timedelta(days=1)
+        if shift_end <= shift_start
+        else attendance_date
+    )
+
+    # Combine dates and times using IST, then convert to UTC.
+    start_ist = datetime.combine(attendance_date, start_time, tzinfo=IST)
+    end_ist = datetime.combine(end_date, end_time, tzinfo=IST)
+
+    return (
+        start_ist.astimezone(timezone.utc),
+        end_ist.astimezone(timezone.utc),
+    )
+
+def compute_late_minutes(
+    punch_in: datetime,
+    shift_start: datetime,
+) -> int:
+    """Return late minutes using the strict 10-minute grace period."""
+    punch_in = truncate_to_seconds(punch_in)
+    shift_start = truncate_to_seconds(shift_start)
+
+    elapsed_seconds = int((punch_in - shift_start).total_seconds())
+
+    # An employee is late only when more than 10 minutes have elapsed.
+    if elapsed_seconds > 600:
+        return elapsed_seconds // 60
+
+    return 0
+
+def compute_work_hours(
+    punch_in: datetime,
+    punch_out: datetime,
+) -> Decimal:
+    """Calculate work hours, rounded to 2 decimal places using half-up."""
+    punch_in = truncate_to_seconds(punch_in)
+    punch_out = truncate_to_seconds(punch_out)
+
+    duration = punch_out - punch_in
+    elapsed_seconds = duration.days * 86400 + duration.seconds
+
+    hours = Decimal(elapsed_seconds) / Decimal(3600)
+
+    return hours.quantize(
+        Decimal("0.01"),
+        rounding=ROUND_HALF_UP,
+    )
 
 
-def compute_overtime(punch_out: datetime, shift_end: str, date_str: str) -> int:
-    h, m = map(int, shift_end.split(":"))
-    end = datetime.fromisoformat(date_str).replace(hour=h, minute=m, tzinfo=IST)
-    return max(0, int((punch_out - end).total_seconds() / 60))
+def compute_half_day(work_hours: Decimal) -> bool:
+    """Return True when rounded work hours are below 4.50."""
+    return work_hours < Decimal("4.50")
+
+
+def compute_overtime(
+    punch_out: datetime,
+    shift_end: datetime,
+) -> int:
+    """Return overtime minutes only when at least 30 whole minutes elapsed."""
+    punch_out = truncate_to_seconds(punch_out)
+    shift_end = truncate_to_seconds(shift_end)
+
+    elapsed_seconds = int((punch_out - shift_end).total_seconds())
+
+    # Early punch-outs and negative gaps never produce overtime.
+    if elapsed_seconds < 0:
+        return 0
+
+    whole_minutes = elapsed_seconds // 60
+
+    # R3: overtime is counted only when it reaches 30 whole minutes.
+    return whole_minutes if whole_minutes >= 30 else 0
+
 
 
 # --------------------------------------------------------------------------- #

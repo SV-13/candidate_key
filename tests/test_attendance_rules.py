@@ -3,9 +3,9 @@ from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal
 
 from app.main import (
-    get_shift_bounds,
-    compute_attendance_date,
     truncate_to_seconds,
+    compute_attendance_date,
+    get_shift_bounds,
     compute_late_minutes,
     compute_overtime,
     compute_work_hours,

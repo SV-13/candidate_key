@@ -10,13 +10,14 @@ openapi.yaml for the contract and DATA_MODEL.md for what is stored in MongoDB.
 """
 import os
 from datetime import date, datetime, timedelta, timezone
-from typing import Optional
+from typing import Annotated, Literal, Optional
 from decimal import Decimal, ROUND_HALF_UP
 
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException
-from pydantic import BaseModel
-from pymongo import MongoClient
+from pydantic import (BaseModel, Field, field_validator, model_validator)
+from pymongo import MongoClient, ASCENDING
+from contextlib import asynccontextmanager
 
 load_dotenv()
 
@@ -28,13 +29,40 @@ client = MongoClient(
 
 db = client[os.getenv("MONGO_DB", "attendance_db")]
 
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """Create required MongoDB indexes when the application starts."""
+
+    db.employees.create_index(
+        [("emp_code", ASCENDING)],
+        unique=True,
+        name="uq_employees_emp_code",
+    )
+
+    db.attendance_logs.create_index(
+        [
+            ("emp_code", ASCENDING),
+            ("date", ASCENDING),
+        ],
+        unique=True,
+        name="uq_attendance_emp_code_date",
+    )
+
+    yield
+
+
 IST = timezone(timedelta(hours=5, minutes=30))
 
 MIN_EPOCH_MS = 100_000_000_000
 MAX_EPOCH_MS = 4_102_444_800_000
 EPOCH_UTC = datetime(1970, 1, 1, tzinfo=timezone.utc)
 
-app = FastAPI(title="Employee Attendance & Analytics API", version="2.0.0")
+app = FastAPI(
+    title="Employee Attendance & Analytics API",
+    version="2.0.0",
+    lifespan=lifespan,
+)
 
 
 # --------------------------------------------------------------------------- #
@@ -178,20 +206,68 @@ def compute_overtime(
 # --------------------------------------------------------------------------- #
 # Models
 # --------------------------------------------------------------------------- #
+
+# Strict epoch-millisecond integer used at the API boundary.
+EpochMillis = Annotated[
+    int,
+    Field(
+        strict=True,
+        ge=MIN_EPOCH_MS,
+        le=MAX_EPOCH_MS,
+    ),
+]
+
+# Only these statuses are permitted when punching in.
+PunchInStatus = Literal["PRESENT", "WFH", "ON_DUTY"]
+
+
 class EmployeeIn(BaseModel):
-    emp_code: str
-    name: str
-    email: str
-    department: str
-    shift_start: str = "09:30"
-    shift_end: str = "18:30"
-    joined_on: str
+    emp_code: str = Field(pattern=r"^EMP\d{4,6}$")
+    name: str = Field(min_length=1, max_length=100)
+    email: str = Field(
+        max_length=120,
+        pattern=r"^[^@\s]+@[^@\s]+\.[^@\s]+$",
+    )
+    department: str = Field(min_length=1, max_length=50)
+    shift_start: str = Field(
+        default="09:30",
+        pattern=r"^([01]\d|2[0-3]):[0-5]\d$",
+    )
+    shift_end: str = Field(
+        default="18:30",
+        pattern=r"^([01]\d|2[0-3]):[0-5]\d$",
+    )
+    joined_on: str = Field(
+        pattern=r"^\d{4}-\d{2}-\d{2}$",
+    )
+
+    @field_validator("joined_on")
+    @classmethod
+    def validate_joined_on(cls, value: str) -> str:
+        """Reject impossible calendar dates while preserving the string."""
+        try:
+            parsed = date.fromisoformat(value)
+        except ValueError as exc:
+            raise ValueError(
+                "joined_on must be a valid YYYY-MM-DD date"
+            ) from exc
+
+        if parsed.isoformat() != value:
+            raise ValueError("joined_on must use YYYY-MM-DD format")
+
+        return value
+
+    @model_validator(mode="after")
+    def validate_shift_times(self):
+        if self.shift_start == self.shift_end:
+            raise ValueError("shift_start and shift_end must differ")
+        return self
 
 
 class PunchInIn(BaseModel):
     emp_code: str
-    punched_at: Optional[int] = None
-    status: str = "PRESENT"
+    punched_at: Optional[EpochMillis] = None
+    status: PunchInStatus = "PRESENT"
 
 
 # --------------------------------------------------------------------------- #

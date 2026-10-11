@@ -117,13 +117,12 @@ def test_late_grace_boundary_truncates_to_whole_seconds():
         date(2026, 7, 6), "09:30", "18:30"
     )
 
-    # 09:40:00.900 truncates to exactly 09:40:00 IST.
-    raw_at_ten_minutes = ist_to_utc(6, 9, 40, 0, 900_000)
-    at_ten_minutes = truncate_to_seconds(raw_at_ten_minutes)
-
-    # 09:40:01.999 truncates to 09:40:01 IST.
-    raw_one_second_after = ist_to_utc(6, 9, 40, 1, 999_000)
-    one_second_after = truncate_to_seconds(raw_one_second_after)
+    at_ten_minutes = truncate_to_seconds(
+    ist_to_utc(6, 9, 40, 0, 900_000)
+    )   
+    one_second_after = truncate_to_seconds(
+    ist_to_utc(6, 9, 40, 1, 999_000)
+    )
 
     assert compute_late_minutes(at_ten_minutes, start) == 0
     assert compute_late_minutes(one_second_after, start) == 10
@@ -144,6 +143,16 @@ def test_overnight_case_b_is_150_minutes_late():
 
     assert attendance_date == date(2026, 7, 6)
     assert compute_late_minutes(punch_in, shift_start) == 150
+
+
+def test_late_minutes_floor_fractional_elapsed_minute():
+    shift_start, _ = get_shift_bounds(
+        date(2026, 7, 6), "09:30", "18:30"
+    )
+
+    punch_in = ist_to_utc(6, 10, 15, 59)
+
+    assert compute_late_minutes(punch_in, shift_start) == 45
 
 
 # ---------------------------------------------------------

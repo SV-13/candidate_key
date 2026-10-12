@@ -4,8 +4,6 @@ from app.main import from_epoch_ms, to_epoch_ms
 
 import pytest
 
-from app.main import from_epoch_ms
-
 UTC = timezone.utc
 EPOCH = datetime(1970, 1, 1, tzinfo=UTC)
 

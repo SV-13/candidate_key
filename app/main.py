@@ -14,9 +14,10 @@ from typing import Annotated, Literal, Optional
 from decimal import Decimal, ROUND_HALF_UP
 
 from dotenv import load_dotenv
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Query
 from pydantic import (BaseModel, Field, field_validator, model_validator)
 from pymongo import MongoClient, ASCENDING
+from pymongo.errors import DuplicateKeyError, PyMongoError
 from contextlib import asynccontextmanager
 
 load_dotenv()
@@ -69,6 +70,22 @@ app = FastAPI(
 # Helpers
 # --------------------------------------------------------------------------- #
 
+def serialize_mongo_value(value):
+    """Convert datetimes in MongoDB documents to epoch milliseconds."""
+    if isinstance(value, datetime):
+        return to_epoch_ms(value)
+
+    if isinstance(value, dict):
+        return {
+            key: serialize_mongo_value(item)
+            for key, item in value.items()
+            if key != "_id"
+        }
+
+    if isinstance(value, list):
+        return [serialize_mongo_value(item) for item in value]
+
+    return value
 
 def from_epoch_ms(value: int) -> datetime:
     """Convert a strict epoch-millisecond integer to whole-second UTC."""
@@ -155,7 +172,7 @@ def compute_late_minutes(
     punch_in: datetime,
     shift_start: datetime,
 ) -> int:
-
+    """Return late minutes after the 10-minute grace period."""
     elapsed_seconds = int((punch_in - shift_start).total_seconds())
 
     # An employee is late only when more than 10 minutes have elapsed.
@@ -168,7 +185,7 @@ def compute_work_hours(
     punch_in: datetime,
     punch_out: datetime,
 ) -> Decimal:
-
+    """Return elapsed work hours rounded to two decimals using half-up rounding."""
     duration = punch_out - punch_in
     elapsed_seconds = duration.days * 86400 + duration.seconds
 
@@ -189,7 +206,7 @@ def compute_overtime(
     punch_out: datetime,
     shift_end: datetime,
 ) -> int:
-
+    """Return whole overtime minutes when the 30-minute threshold is met."""
     elapsed_seconds = int((punch_out - shift_end).total_seconds())
 
     # Early punch-outs and negative gaps never produce overtime.
@@ -275,54 +292,143 @@ class PunchInIn(BaseModel):
 # --------------------------------------------------------------------------- #
 @app.get("/health")
 def health():
+    try:
+        db.command("ping")
+    except PyMongoError:
+        raise HTTPException(
+            status_code=503,
+            detail="MongoDB unavailable",
+        ) from None
+
     return {"status": "ok"}
 
 
 @app.post("/employees", status_code=201)
 def create_employee(body: EmployeeIn):
+    # 1. Check for an existing employee for a friendly 409 response.
     if db.employees.find_one({"emp_code": body.emp_code}):
         raise HTTPException(409, "emp_code already exists")
+
+    # 2. Prepare the document with a UTC timestamp at whole-second precision.
     doc = body.model_dump()
-    doc["created_at"] = datetime.now(timezone.utc)
-    db.employees.insert_one(doc)
+    doc["created_at"] = truncate_to_seconds(datetime.now(timezone.utc))
+
+    # 3. The unique index is the final protection against concurrent inserts.
+    try:
+        db.employees.insert_one(doc)
+    except DuplicateKeyError:
+        raise HTTPException(409, "emp_code already exists")
+
+    # 4. Remove MongoDB's internal ID and convert created_at to epoch ms.
     doc.pop("_id", None)
-    return doc
+    return serialize_mongo_value(doc)
+
 
 
 @app.get("/employees")
-def list_employees(department: Optional[str] = None, page: int = 1, page_size: int = 20):
-    q = {}
+def list_employees(
+    department: Optional[str] = None,
+    page: int = Query(1, ge=1),
+    page_size: int = Query(20, ge=1, le=100),
+):
+    query = {}
+
     if department:
-        q["department"] = department
-    skip = page * page_size
-    total = db.employees.count_documents({})
-    items = list(db.employees.find(q, {"_id": 0}).skip(skip).limit(page_size))
-    return {"items": items, "total": total, "page": page, "page_size": page_size}
+        query["department"] = department
+
+    # Offset for 1-based pagination.
+    skip = (page - 1) * page_size
+
+    # Count only employees matching the filter.
+    total = db.employees.count_documents(query)
+
+    # Return a stable, sorted page of results.
+    cursor = (
+        db.employees.find(query, {"_id": 0})
+        .sort("emp_code", ASCENDING)
+        .skip(skip)
+        .limit(page_size)
+    )
+
+    items = [
+        serialize_mongo_value(employee)
+        for employee in cursor
+    ]
+
+    return {
+        "items": items,
+        "total": total,
+        "page": page,
+        "page_size": page_size,
+    }
 
 
 @app.post("/attendance/punch-in", status_code=201)
 def punch_in(body: PunchInIn):
+    # 1. Find the employee before accessing shift details.
     emp = db.employees.find_one({"emp_code": body.emp_code})
-    ts = datetime.fromtimestamp(body.punched_at / 1000) if body.punched_at else datetime.now(timezone.utc)
-    d = ts.date().isoformat()
-    if db.attendance_logs.find_one({"emp_code": body.emp_code, "date": d}):
-        raise HTTPException(409, "already punched in for this date")
+
+    if emp is None:
+        raise HTTPException(404, "employee not found")
+
+    # 2. Resolve the timestamp and normalize it to whole seconds.
+    if body.punched_at is not None:
+        ts = from_epoch_ms(body.punched_at)
+    else:
+        ts = truncate_to_seconds(datetime.now(timezone.utc))
+
+    # 3. Calculate the attendance date in IST, including overnight shifts.
+    attendance_date = compute_attendance_date(
+        ts,
+        emp["shift_start"],
+        emp["shift_end"],
+    )
+    date_str = attendance_date.isoformat()
+
+    # 4. Obtain the actual shift start and calculate lateness.
+    shift_start, _ = get_shift_bounds(
+        attendance_date,
+        emp["shift_start"],
+        emp["shift_end"],
+    )
+    late_minutes = compute_late_minutes(ts, shift_start)
+
+    # 5. Create the new attendance record.
     doc = {
         "emp_code": body.emp_code,
-        "date": d,
+        "date": date_str,
         "status": body.status,
         "punch_in": ts,
         "punch_out": None,
         "work_hours": None,
-        "late_minutes": compute_late_minutes(ts, emp["shift_start"]),
+        "late_minutes": late_minutes,
         "overtime_minutes": 0,
         "half_day": False,
         "history": [],
     }
-    res = db.attendance_logs.insert_one(doc)
-    doc["id"] = str(res.inserted_id)
-    doc.pop("_id", None)
-    return doc
+
+    # 6. Let MongoDB's unique index enforce race-safe uniqueness.
+    try:
+        db.attendance_logs.insert_one(doc)
+    except DuplicateKeyError:
+        raise HTTPException(
+            409,
+            "already punched in for this date",
+        ) from None
+
+    # 7. Return the public API representation; never expose MongoDB _id.
+    return {
+        "emp_code": doc["emp_code"],
+        "date": doc["date"],
+        "status": doc["status"],
+        "punch_in": to_epoch_ms(ts),
+        "punch_out": None,
+        "work_hours": None,
+        "late_minutes": late_minutes,
+        "overtime_minutes": 0,
+        "half_day": False,
+        "history": [],
+    }
 
 
 @app.get("/attendance")

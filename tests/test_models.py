@@ -1,7 +1,3 @@
-
-
-from datetime import date
-
 import pytest
 from pydantic import ValidationError
 

@@ -24,3 +24,37 @@ MongoDB **6.0 or newer** is required (the grader uses 7.0). MongoDB Atlas free t
 ## Submit
 A public Git repository with `app/main.py`, `requirements.txt`, `REVIEW.md`, `DECISIONS.md` and a short `README.md`.
 No `.env`, no secrets, no Dockerfile.
+
+## Development and testing
+
+Install the development and testing dependencies in your virtual environment:
+
+```bash
+python -m pip install pytest httpx
+```
+
+Run the automated test suite:
+
+```bash
+pytest -q
+```
+
+Run the real-MongoDB concurrency tests with the API and MongoDB running:
+
+```bash
+python scripts/race_test.py
+```
+
+The concurrency script sends 20 simultaneous requests to each endpoint. Expected results are one `201` and nineteen `409` responses for employee creation, one `201` and nineteen `409` responses for punch-in, and one `200` and nineteen `409` responses for punch-out.
+
+The concurrency script creates test employees and attendance records in the configured database and leaves them there. Run it against a development or test database, not production.
+
+## Attendance implementation notes
+
+API timestamps are integer epoch milliseconds. Datetimes used for storage and calculations are timezone-aware UTC instants; attendance dates and shift bounds follow IST, including overnight shifts.
+
+Punch-out timestamps must be strictly later than punch-in and no more than 24 hours later. Exactly 24 hours is allowed. Invalid punch-out timestamps are validated before checking whether the attendance record is already closed, so an invalid timestamp returns `422` rather than `409`.
+
+Punch-out uses a conditional atomic MongoDB update to prevent two simultaneous requests from closing the same attendance record successfully. Punch-in and punch-out do not write to the attendance `history` field.
+
+The application uses a two-second MongoDB server-selection timeout. If MongoDB or required index creation is unavailable during startup, the application can start in degraded mode; `/health` returns `503` until database readiness and required indexes are established.

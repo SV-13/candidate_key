@@ -9,6 +9,7 @@ works, but nobody has reviewed it. Read PROBLEM_STATEMENT.docx for what is expec
 openapi.yaml for the contract and DATA_MODEL.md for what is stored in MongoDB.
 """
 import os
+import logging
 from datetime import date, datetime, timedelta, timezone
 from typing import Annotated, Literal, Optional
 from decimal import Decimal, ROUND_HALF_UP
@@ -16,7 +17,7 @@ from decimal import Decimal, ROUND_HALF_UP
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException, Query
 from pydantic import (BaseModel, Field, field_validator, model_validator)
-from pymongo import MongoClient, ASCENDING
+from pymongo import MongoClient, ASCENDING, DESCENDING, ReturnDocument
 from pymongo.errors import DuplicateKeyError, PyMongoError
 from contextlib import asynccontextmanager
 
@@ -26,15 +27,17 @@ load_dotenv()
 client = MongoClient(
     os.getenv("MONGO_URI", "mongodb://localhost:27017"),
     tz_aware=True,
+    serverSelectionTimeoutMS=2000,
 )
 
 db = client[os.getenv("MONGO_DB", "attendance_db")]
 
+logger = logging.getLogger(__name__)
+indexes_ready = False
 
-@asynccontextmanager
-async def lifespan(app: FastAPI):
-    """Create required MongoDB indexes when the application starts."""
 
+def ensure_indexes():
+    """Create all indexes required for correct API behaviour."""
     db.employees.create_index(
         [("emp_code", ASCENDING)],
         unique=True,
@@ -50,8 +53,32 @@ async def lifespan(app: FastAPI):
         name="uq_attendance_emp_code_date",
     )
 
-    yield
+    db.attendance_logs.create_index(
+        [
+            ("emp_code", ASCENDING),
+            ("punch_in", DESCENDING),
+        ],
+        name="idx_attendance_emp_code_punch_in",
+    )
 
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """Start in degraded mode if MongoDB or index creation is unavailable."""
+    global indexes_ready
+
+    try:
+        ensure_indexes()
+        indexes_ready = True
+    except PyMongoError:
+        indexes_ready = False
+        logger.warning(
+            "MongoDB indexes could not be verified at startup; "
+            "the application will start in degraded mode.",
+            exc_info=True,
+        )
+
+    yield
 
 IST = timezone(timedelta(hours=5, minutes=30))
 
@@ -286,22 +313,35 @@ class PunchInIn(BaseModel):
     punched_at: Optional[EpochMillis] = None
     status: PunchInStatus = "PRESENT"
 
+class PunchOutIn(BaseModel):
+    emp_code: str
+    punched_at: Optional[EpochMillis] = None
+
 
 # --------------------------------------------------------------------------- #
 # Endpoints provided
 # --------------------------------------------------------------------------- #
 @app.get("/health")
 def health():
+    global indexes_ready
+
     try:
+        # Verify MongoDB can respond.
         db.command("ping")
+
+        # If startup could not create the indexes, retry here.
+        if not indexes_ready:
+            ensure_indexes()
+            indexes_ready = True
+
     except PyMongoError:
+        indexes_ready = False
         raise HTTPException(
             status_code=503,
             detail="MongoDB unavailable",
         ) from None
 
     return {"status": "ok"}
-
 
 @app.post("/employees", status_code=201)
 def create_employee(body: EmployeeIn):
@@ -333,7 +373,7 @@ def list_employees(
 ):
     query = {}
 
-    if department:
+    if department is not None:
         query["department"] = department
 
     # Offset for 1-based pagination.
@@ -430,6 +470,115 @@ def punch_in(body: PunchInIn):
         "history": [],
     }
 
+@app.post("/attendance/punch-out")
+def punch_out(body: PunchOutIn):
+    # 1. Look up the employee.
+    employee = db.employees.find_one({"emp_code": body.emp_code})
+    if employee is None:
+        raise HTTPException(404, "employee not found")
+
+    # 2. Resolve and normalize the requested punch-out instant.
+    if body.punched_at is not None:
+        ts = from_epoch_ms(body.punched_at)
+    else:
+        ts = truncate_to_seconds(datetime.now(timezone.utc))
+
+    # 3. Find the newest record for this employee that was punched
+    #    in at or before the requested punch-out time.
+    candidate = db.attendance_logs.find_one(
+        {
+            "emp_code": body.emp_code,
+            "punch_in": {"$lte": ts},
+        },
+        sort=[("punch_in", DESCENDING)],
+    )
+
+    if candidate is None:
+        # Distinguish an invalid timestamp before a recorded punch-in
+        # from a complete absence of an eligible attendance record.
+        future_record = db.attendance_logs.find_one(
+            {
+                "emp_code": body.emp_code,
+                "punch_in": {"$gt": ts},
+            },
+            sort=[("punch_in", ASCENDING)],
+        )
+
+        if future_record is not None:
+            raise HTTPException(
+                422,
+                "punched_at must be after punch_in",
+            )
+
+        raise HTTPException(404, "attendance record not found")
+
+    # 4. Validate time before checking whether the record is closed.
+    #    This means invalid time takes precedence over HTTP 409.
+    original_punch_in = candidate["punch_in"]
+    elapsed = ts - original_punch_in
+
+    if elapsed.total_seconds() <= 0:
+        raise HTTPException(
+            422,
+            "punched_at must be after punch_in",
+        )
+
+    if elapsed > timedelta(hours=24):
+        raise HTTPException(
+            422,
+            "punched_at cannot be more than 24 hours after punch_in",
+        )
+
+    if candidate.get("punch_out") is not None:
+        raise HTTPException(409, "attendance record is already closed")
+
+    # 5. Calculate values using the attendance record's stored date.
+    #    This is important for shifts that cross midnight.
+    attendance_date = date.fromisoformat(candidate["date"])
+
+    _, shift_end = get_shift_bounds(
+        attendance_date,
+        employee["shift_start"],
+        employee["shift_end"],
+    )
+
+    work_hours_decimal = compute_work_hours(original_punch_in, ts)
+    work_hours = float(work_hours_decimal)
+
+    overtime_minutes = compute_overtime(ts, shift_end)
+    half_day = compute_half_day(work_hours_decimal)
+
+    # 6. Atomically close the same record we calculated from.
+    #    Pin the original punch_in to prevent overwriting a concurrent
+    #    correction, and require the record to remain open.
+    updated = db.attendance_logs.find_one_and_update(
+        {
+            "_id": candidate["_id"],
+            "emp_code": body.emp_code,
+            "date": candidate["date"],
+            "punch_in": original_punch_in,
+            "punch_out": None,
+        },
+        {
+            "$set": {
+                "punch_out": ts,
+                "work_hours": work_hours,
+                "overtime_minutes": overtime_minutes,
+                "half_day": half_day,
+            }
+        },
+        return_document=ReturnDocument.AFTER,
+    )
+
+    if updated is None:
+        raise HTTPException(
+            409,
+            "attendance record was already closed or changed",
+        )
+
+    # 7. Convert datetimes to epoch milliseconds and hide MongoDB _id.
+    #    Punch-out deliberately does not write to history.
+    return serialize_mongo_value(updated)
 
 @app.get("/attendance")
 def list_attendance(

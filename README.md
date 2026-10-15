@@ -66,13 +66,13 @@ The concurrency script creates test records and leaves them in the database. Use
 - Punch-in and punch-out, including timestamp validation and concurrency protection.
 - Shared attendance response serialization and legacy-field defaults.
 - `GET /attendance`, including query validation, database-side pagination, stable sorting, and regression tests.
+- `PATCH /attendance/{emp_code}/{date}`, including validation, derived-field recomputation, no-op rejection, audit history, and atomic conflict protection.
 - Database health checks and automated tests for implemented behavior.
 
 **In progress**
-- `REVIEW.md` and `DECISIONS.md` submission documentation.
+- Final review of `REVIEW.md` and `DECISIONS.md` submission documentation.
 
 **Not started**
-- `PATCH /attendance/{emp_code}/{date}`.
 - The four analytics endpoints.
 - `/admin/explain/{endpoint}`.
 

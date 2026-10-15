@@ -329,6 +329,18 @@ class EmployeeIn(BaseModel):
         return self
 
 
+class RegularizeRequest(BaseModel):
+    """Fields accepted when manually correcting an attendance record."""
+
+    status: Optional[
+        Literal["PRESENT", "ABSENT", "LEAVE", "WFH", "ON_DUTY"]
+    ] = None
+    punch_in: Optional[EpochMillis] = None
+    punch_out: Optional[EpochMillis] = None
+    reason: str = Field(min_length=5, max_length=200)
+    regularized_by: str = Field(min_length=1, max_length=50)
+
+
 class PunchInIn(BaseModel):
     emp_code: str
     punched_at: Optional[EpochMillis] = None
@@ -654,6 +666,248 @@ def list_attendance(
         "page": page,
         "page_size": page_size,
     }
+
+@app.patch("/attendance/{emp_code}/{date}")
+def regularize_attendance(
+    emp_code: str,
+    date: str,
+    body: RegularizeRequest,
+):
+    # 1. Validate the path date strictly as YYYY-MM-DD.
+    try:
+        parsed_date = datetime.strptime(date, "%Y-%m-%d").date()
+    except ValueError:
+        raise HTTPException(
+            422, "date must be a valid date in YYYY-MM-DD format"
+        ) from None
+
+    if parsed_date.isoformat() != date:
+        raise HTTPException(
+            422, "date must be in YYYY-MM-DD format"
+        )
+
+    supplied = body.model_fields_set
+
+    if "status" in supplied and body.status is None:
+        raise HTTPException(422, "status cannot be null")
+
+    # 2. Both the employee and the natural-key attendance record must exist.
+    employee = db.employees.find_one({"emp_code": emp_code})
+    if employee is None:
+        raise HTTPException(404, "employee not found")
+
+    record = db.attendance_logs.find_one({
+        "emp_code": emp_code,
+        "date": date,
+    })
+    if record is None:
+        raise HTTPException(404, "attendance record not found")
+
+    # 3. Resolve the final status, preserving the stored status when omitted.
+    final_status = (
+        body.status if "status" in supplied else record.get("status")
+    )
+    if final_status not in {"PRESENT", "ABSENT", "LEAVE", "WFH", "ON_DUTY"}:
+        raise HTTPException(422, "record has an invalid status")
+
+    punch_in_supplied = "punch_in" in supplied
+    punch_out_supplied = "punch_out" in supplied
+
+    # ABSENT and LEAVE clear both punch times. Supplying either time together
+    # with a final non-presence status is invalid, even when status was omitted.
+    if final_status in {"ABSENT", "LEAVE"}:
+        if punch_in_supplied or punch_out_supplied:
+            raise HTTPException(
+                422,
+                "punch_in and punch_out cannot be supplied with ABSENT or LEAVE",
+            )
+        final_punch_in = None
+        final_punch_out = None
+    else:
+        try:
+            if punch_in_supplied:
+                final_punch_in = (
+                    from_epoch_ms(body.punch_in)
+                    if body.punch_in is not None
+                    else None
+                )
+            else:
+                final_punch_in = record.get("punch_in")
+
+            if punch_out_supplied:
+                final_punch_out = (
+                    from_epoch_ms(body.punch_out)
+                    if body.punch_out is not None
+                    else None
+                )
+            else:
+                final_punch_out = record.get("punch_out")
+        except ValueError as exc:
+            raise HTTPException(422, str(exc)) from None
+
+    # 4. Recompute every derived field from the final status and final times.
+    if final_status in {"PRESENT", "WFH", "ON_DUTY"}:
+        if final_punch_in is None:
+            raise HTTPException(
+                422, "a presence status requires a punch_in"
+            )
+
+        if not isinstance(final_punch_in, datetime):
+            raise HTTPException(422, "punch_in must be a valid timestamp")
+
+        shift_start, shift_end = get_shift_bounds(
+            parsed_date,
+            employee["shift_start"],
+            employee["shift_end"],
+        )
+
+        if compute_attendance_date(
+            final_punch_in,
+            employee["shift_start"],
+            employee["shift_end"],
+        ) != parsed_date:
+            raise HTTPException(
+                422, "punch_in must belong to the record's attendance date"
+            )
+
+        if final_punch_out is not None:
+            if not isinstance(final_punch_out, datetime):
+                raise HTTPException(422, "punch_out must be a valid timestamp")
+
+            duration = final_punch_out - final_punch_in
+            if duration.total_seconds() <= 0:
+                raise HTTPException(422, "punch_out must be after punch_in")
+            if duration > timedelta(hours=24):
+                raise HTTPException(
+                    422, "punch_out must be within 24 hours of punch_in"
+                )
+
+            computed_hours = compute_work_hours(
+                final_punch_in, final_punch_out
+            )
+            new_work_hours = float(computed_hours)
+            new_overtime = compute_overtime(final_punch_out, shift_end)
+            new_half_day = compute_half_day(computed_hours)
+        else:
+            new_work_hours = None
+            new_overtime = 0
+            new_half_day = False
+
+        new_late_minutes = compute_late_minutes(
+            final_punch_in, shift_start
+        )
+    else:
+        # Non-presence statuses have no punch times or derived work metrics.
+        new_work_hours = None
+        new_late_minutes = 0
+        new_overtime = 0
+        new_half_day = False
+
+    new_values = {
+        "status": final_status,
+        "punch_in": final_punch_in,
+        "punch_out": final_punch_out,
+        "work_hours": new_work_hours,
+        "late_minutes": new_late_minutes,
+        "overtime_minutes": new_overtime,
+        "half_day": new_half_day,
+    }
+
+    # 5. Keep only real changes. Compare timestamps at whole-second precision
+    #    and compare work_hours as floats. "from" values remain stored values.
+    def equivalent(field, old_value, new_value):
+        if field in {"punch_in", "punch_out"}:
+            if old_value is None or new_value is None:
+                return old_value is None and new_value is None
+            if isinstance(old_value, datetime) and isinstance(new_value, datetime):
+                return (
+                    truncate_to_seconds(old_value)
+                    == truncate_to_seconds(new_value)
+                )
+
+        if field == "work_hours":
+            if old_value is None or new_value is None:
+                return old_value is None and new_value is None
+            try:
+                return float(old_value) == float(new_value)
+            except (TypeError, ValueError):
+                return old_value == new_value
+
+        return old_value == new_value
+
+    changes = {}
+    for field, new_value in new_values.items():
+        old_value = record.get(field)
+        if not equivalent(field, old_value, new_value):
+            changes[field] = {
+                "from": old_value,
+                "to": new_value,
+            }
+
+    if not changes:
+        raise HTTPException(422, "request changes nothing")
+
+    # A missing history field represents an empty history. Other malformed
+    # history values are not safe to append to.
+    if "history" not in record:
+        history_snapshot = []
+    else:
+        history_snapshot = record["history"]
+
+    if not isinstance(history_snapshot, list):
+        raise HTTPException(409, "attendance history is not an array")
+
+    history_entry = {
+        "at": truncate_to_seconds(datetime.now(timezone.utc)),
+        "by": body.regularized_by,
+        "reason": body.reason,
+        "changes": changes,
+    }
+
+    # 6. Atomically pin the original mutable state AND original history.
+    #    $ifNull lets the history comparison match legacy documents where
+    #    the field is missing; $literal treats the snapshot as a value.
+    update_filter = {
+        "_id": record["_id"],
+        "emp_code": emp_code,
+        "date": date,
+        "$expr": {
+            "$eq": [
+                {"$ifNull": ["$history", []]},
+                {"$literal": history_snapshot},
+            ]
+        },
+    }
+
+    for field in (
+        "status",
+        "punch_in",
+        "punch_out",
+        "work_hours",
+        "late_minutes",
+        "overtime_minutes",
+        "half_day",
+    ):
+        update_filter[field] = record.get(field)
+
+    updated = db.attendance_logs.find_one_and_update(
+        update_filter,
+        {
+            "$set": new_values,
+            "$push": {"history": history_entry},
+        },
+        return_document=ReturnDocument.AFTER,
+    )
+
+    if updated is None:
+        raise HTTPException(
+            409,
+            "attendance record was changed concurrently; retry the regularization",
+        )
+
+    # 7. Use the shared public representation, including nested history times.
+    return serialize_attendance(updated)
+
 
 # --------------------------------------------------------------------------- #
 # TODO - the rest of the contract (see openapi.yaml):

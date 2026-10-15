@@ -918,3 +918,155 @@ def regularize_attendance(
 #   GET   /analytics/departments/{department}/trend
 #   GET   /admin/explain/{endpoint}
 # --------------------------------------------------------------------------- #
+
+
+# --------------------------------------------------------------------------- #
+# Analytics: employee monthly summary
+# --------------------------------------------------------------------------- #
+
+def count_weekdays(start: date, end: date) -> int:
+    """Count Monday-Friday dates inclusively, with no holiday calendar."""
+    if end < start:
+        return 0
+
+    total_days = (end - start).days + 1
+    full_weeks, remainder = divmod(total_days, 7)
+    weekdays = full_weeks * 5
+
+    for offset in range(remainder):
+        if (start.weekday() + offset) % 7 < 5:
+            weekdays += 1
+
+    return weekdays
+
+
+@app.get("/analytics/employees/{emp_code}/monthly")
+def employee_monthly(
+    emp_code: str,
+    month: str = Query(..., pattern=r"^\d{4}-(0[1-9]|1[0-2])$"),
+):
+    """Return one employee's attendance summary for a calendar month."""
+    # Validate the calendar month, including invalid years such as 0000.
+    year, month_number = map(int, month.split("-"))
+    try:
+        month_start = date(year, month_number, 1)
+        if month_number == 12:
+            month_end = date(year, 12, 31)
+        else:
+            month_end = date(year, month_number + 1, 1) - timedelta(days=1)
+    except ValueError:
+        raise HTTPException(422, "month must be a valid YYYY-MM calendar month")
+
+    employee = db.employees.find_one(
+        {"emp_code": emp_code},
+        {"_id": 0, "emp_code": 1, "joined_on": 1},
+    )
+    if employee is None:
+        raise HTTPException(404, "employee not found")
+
+    try:
+        joined_on = date.fromisoformat(employee["joined_on"])
+    except (KeyError, TypeError, ValueError):
+        raise HTTPException(500, "employee has an invalid joined_on date")
+
+    effective_start = max(month_start, joined_on)
+    working_days = count_weekdays(effective_start, month_end)
+
+    pipeline = [
+        {
+            "$match": {
+                "emp_code": emp_code,
+                "date": {
+                    "$gte": month_start.isoformat(),
+                    "$lte": month_end.isoformat(),
+                },
+            }
+        },
+        {
+            "$set": {
+                "__is_weekday": {
+                    "$in": [
+                        {
+                            "$isoDayOfWeek": {
+                                "$dateFromString": {
+                                    "dateString": "$date",
+                                    "format": "%Y-%m-%d",
+                                }
+                            }
+                        },
+                        [1, 2, 3, 4, 5],
+                    ]
+                },
+                "__is_presence": {
+                    "$in": ["$status", ["PRESENT", "WFH", "ON_DUTY"]]
+                },
+                "__late_minutes": {"$ifNull": ["$late_minutes", 0]},
+                "__overtime_minutes": {"$ifNull": ["$overtime_minutes", 0]},
+            }
+        },
+        {
+            "$group": {
+                "_id": None,
+                "present_days": {
+                    "$sum": {
+                        "$cond": [
+                            {"$and": ["$__is_weekday", "$__is_presence"]},
+                            {
+                                "$cond": [
+                                    {"$ifNull": ["$half_day", False]},
+                                    0.5,
+                                    1.0,
+                                ]
+                            },
+                            0,
+                        ]
+                    }
+                },
+                "leave_days": {
+                    "$sum": {"$cond": [{"$eq": ["$status", "LEAVE"]}, 1, 0]}
+                },
+                "late_count": {
+                    "$sum": {
+                        "$cond": [{"$gt": ["$__late_minutes", 0]}, 1, 0]
+                    }
+                },
+                "total_late_minutes": {"$sum": "$__late_minutes"},
+                "total_overtime_minutes": {"$sum": "$__overtime_minutes"},
+            }
+        },
+        {"$project": {"_id": 0}},
+    ]
+
+    result = next(db.attendance_logs.aggregate(pipeline), None)
+
+    # An empty month has no $group output, so use zero attendance totals.
+    if result is None:
+        result = {
+            "present_days": 0,
+            "leave_days": 0,
+            "late_count": 0,
+            "total_late_minutes": 0,
+            "total_overtime_minutes": 0,
+        }
+
+    present_days = float(result["present_days"])
+    if working_days == 0:
+        attendance_pct = None
+    else:
+        attendance_pct = float(
+            (
+                Decimal(str(present_days)) * Decimal(100) / Decimal(working_days)
+            ).quantize(Decimal("0.0001"), rounding=ROUND_HALF_UP)
+        )
+
+    return {
+        "emp_code": emp_code,
+        "month": month,
+        "working_days": working_days,
+        "present_days": present_days,
+        "leave_days": result["leave_days"],
+        "late_count": result["late_count"],
+        "total_late_minutes": result["total_late_minutes"],
+        "total_overtime_minutes": result["total_overtime_minutes"],
+        "attendance_pct": attendance_pct,
+    }

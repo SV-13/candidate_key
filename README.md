@@ -67,13 +67,14 @@ The concurrency script creates test records and leaves them in the database. Use
 - Shared attendance response serialization and legacy-field defaults.
 - `GET /attendance`, including query validation, database-side pagination, stable sorting, and regression tests.
 - `PATCH /attendance/{emp_code}/{date}`, including validation, derived-field recomputation, no-op rejection, audit history, and atomic conflict protection.
+- `GET /analytics/employees/{emp_code}/monthly`, including MongoDB aggregation, mid-month joining rules, empty-month handling, and four-decimal percentage rounding.
 - Database health checks and automated tests for implemented behavior.
 
 **In progress**
 - Final review of `REVIEW.md` and `DECISIONS.md` submission documentation.
 
 **Not started**
-- The four analytics endpoints.
+- The remaining three analytics endpoints: department summary, late leaderboard, and department trend.
 - `/admin/explain/{endpoint}`.
 
 ## Design notes

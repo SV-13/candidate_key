@@ -44,6 +44,16 @@ def ensure_indexes():
         name="uq_employees_emp_code",
     )
 
+    db.employees.create_index(
+        [("joined_on", ASCENDING)],
+        name="idx_employees_joined_on",
+    )
+
+    db.employees.create_index(
+        [("department", ASCENDING), ("joined_on", ASCENDING)],
+        name="idx_employees_department_joined_on",
+    )
+
     db.attendance_logs.create_index(
         [
             ("emp_code", ASCENDING),
@@ -1070,3 +1080,282 @@ def employee_monthly(
         "total_overtime_minutes": result["total_overtime_minutes"],
         "attendance_pct": attendance_pct,
     }
+
+
+# --------------------------------------------------------------------------- #
+# Analytics: department monthly summary
+# --------------------------------------------------------------------------- #
+
+@app.get("/analytics/departments/summary")
+def department_summary(
+    month: str = Query(..., pattern=r"^\d{4}-(0[1-9]|1[0-2])$"),
+    department: Optional[str] = None,
+):
+    """Return department-level attendance totals for a calendar month."""
+    year, month_number = map(int, month.split("-"))
+    try:
+        month_start = date(year, month_number, 1)
+        if month_number == 12:
+            month_end = date(year, 12, 31)
+        else:
+            month_end = date(year, month_number + 1, 1) - timedelta(days=1)
+    except ValueError:
+        raise HTTPException(422, "month must be a valid YYYY-MM calendar month")
+
+    start_text = month_start.isoformat()
+    end_text = month_end.isoformat()
+
+    employee_filter = {"joined_on": {"$lte": end_text}}
+    if department is not None:
+        employee_filter["department"] = department
+
+    pipeline = [
+        {"$match": employee_filter},
+        {
+            "$lookup": {
+                "from": "attendance_logs",
+                "localField": "emp_code",
+                "foreignField": "emp_code",
+                "pipeline": [
+                    {
+                        "$match": {
+                            "date": {"$gte": start_text, "$lte": end_text}
+                        }
+                    }
+                ],
+                "as": "__logs",
+            }
+        },
+        {
+            "$unwind": {
+                "path": "$__logs",
+                "preserveNullAndEmptyArrays": True,
+            }
+        },
+        {
+            "$set": {
+                "__has_log": {
+                    "$ne": [{"$ifNull": ["$__logs", None]}, None]
+                },
+                "__late": {"$ifNull": ["$__logs.late_minutes", 0]},
+                "__overtime": {
+                    "$ifNull": ["$__logs.overtime_minutes", 0]
+                },
+                "__is_presence": {
+                    "$in": ["$__logs.status", ["PRESENT", "WFH", "ON_DUTY"]]
+                },
+                "__is_weekday": {
+                    "$cond": [
+                        {
+                            "$ne": [
+                                {"$ifNull": ["$__logs.date", None]},
+                                None,
+                            ]
+                        },
+                        {
+                            "$in": [
+                                {
+                                    "$isoDayOfWeek": {
+                                        "$dateFromString": {
+                                            "dateString": "$__logs.date",
+                                            "format": "%Y-%m-%d",
+                                            "onError": None,
+                                            "onNull": None,
+                                        }
+                                    }
+                                },
+                                [1, 2, 3, 4, 5],
+                            ]
+                        },
+                        False,
+                    ]
+                },
+            }
+        },
+        {
+            "$group": {
+                "_id": "$emp_code",
+                "department": {"$first": "$department"},
+                "present_days": {
+                    "$sum": {
+                        "$cond": [
+                            {
+                                "$and": [
+                                    "$__has_log",
+                                    "$__is_weekday",
+                                    "$__is_presence",
+                                ]
+                            },
+                            {
+                                "$cond": [
+                                    {"$ifNull": ["$__logs.half_day", False]},
+                                    0.5,
+                                    1.0,
+                                ]
+                            },
+                            0,
+                        ]
+                    }
+                },
+                "work_hours_sum": {
+                    "$sum": {
+                        "$cond": [
+                            {
+                                "$and": [
+                                    "$__has_log",
+                                    "$__is_presence",
+                                    {
+                                        "$ne": [
+                                            {
+                                                "$ifNull": [
+                                                    "$__logs.work_hours",
+                                                    None,
+                                                ]
+                                            },
+                                            None,
+                                        ]
+                                    },
+                                ]
+                            },
+                            "$__logs.work_hours",
+                            0,
+                        ]
+                    }
+                },
+                "work_hours_count": {
+                    "$sum": {
+                        "$cond": [
+                            {
+                                "$and": [
+                                    "$__has_log",
+                                    "$__is_presence",
+                                    {
+                                        "$ne": [
+                                            {
+                                                "$ifNull": [
+                                                    "$__logs.work_hours",
+                                                    None,
+                                                ]
+                                            },
+                                            None,
+                                        ]
+                                    },
+                                ]
+                            },
+                            1,
+                            0,
+                        ]
+                    }
+                },
+                "late_count": {
+                    "$sum": {
+                        "$cond": [
+                            {
+                                "$and": [
+                                    "$__has_log",
+                                    {"$gt": ["$__late", 0]},
+                                ]
+                            },
+                            1,
+                            0,
+                        ]
+                    }
+                },
+                "total_late_minutes": {
+                    "$sum": {
+                        "$cond": [
+                            {
+                                "$and": [
+                                    "$__has_log",
+                                    {"$gt": ["$__late", 0]},
+                                ]
+                            },
+                            "$__late",
+                            0,
+                        ]
+                    }
+                },
+                "total_overtime_minutes": {
+                    "$sum": {
+                        "$cond": ["$__has_log", "$__overtime", 0]
+                    }
+                },
+                "leave_count": {
+                    "$sum": {
+                        "$cond": [
+                            {
+                                "$and": [
+                                    "$__has_log",
+                                    {"$eq": ["$__logs.status", "LEAVE"]},
+                                ]
+                            },
+                            1,
+                            0,
+                        ]
+                    }
+                },
+                "on_duty_count": {
+                    "$sum": {
+                        "$cond": [
+                            {
+                                "$and": [
+                                    "$__has_log",
+                                    {"$eq": ["$__logs.status", "ON_DUTY"]},
+                                ]
+                            },
+                            1,
+                            0,
+                        ]
+                    }
+                },
+            }
+        },
+        {
+            "$group": {
+                "_id": "$department",
+                "headcount": {"$sum": 1},
+                "present_days": {"$sum": "$present_days"},
+                "work_hours_sum": {"$sum": "$work_hours_sum"},
+                "work_hours_count": {"$sum": "$work_hours_count"},
+                "late_count": {"$sum": "$late_count"},
+                "total_late_minutes": {"$sum": "$total_late_minutes"},
+                "total_overtime_minutes": {
+                    "$sum": "$total_overtime_minutes"
+                },
+                "leave_count": {"$sum": "$leave_count"},
+                "on_duty_count": {"$sum": "$on_duty_count"},
+            }
+        },
+        {"$sort": {"_id": 1}},
+    ]
+
+    items = []
+    employee_index_hint = (
+        "idx_employees_department_joined_on"
+        if department is not None
+        else "idx_employees_joined_on"
+    )
+    for row in db.employees.aggregate(pipeline, hint=employee_index_hint):
+        count = row["work_hours_count"]
+        if count:
+            avg_work_hours = (
+                Decimal(str(row["work_hours_sum"])) / Decimal(count)
+            ).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+            avg_work_hours = float(avg_work_hours)
+        else:
+            avg_work_hours = None
+
+        items.append(
+            {
+                "department": row["_id"],
+                "headcount": row["headcount"],
+                "present_days": float(row["present_days"]),
+                "avg_work_hours": avg_work_hours,
+                "late_count": row["late_count"],
+                "total_late_minutes": row["total_late_minutes"],
+                "leave_count": row["leave_count"],
+                "on_duty_count": row["on_duty_count"],
+            }
+        )
+
+    return {"month": month, "items": items}

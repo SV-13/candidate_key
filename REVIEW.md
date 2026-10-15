@@ -44,6 +44,8 @@
 
 | 36 | `department_trend` — missing dates, headcount and rolling average | Dates with no attendance logs must still appear. Headcount changes with `joined_on`; half-days count as 0.5; weekend and zero-headcount rates must be null; the moving average uses only non-null rates within the requested range. | Test gap-filled series, weekday/weekend rates, mid-range joiners, the rolling window, unknown departments, reversed ranges, and the 92-day boundary. Inspect both lookup indexes. | **Implemented and verified.** Seven real-MongoDB integration tests pass. Both lookups used indexes in explain testing: `idx_employees_department_joined_on` and `idx_attendance_date_emp_code`, with zero collection scans in either lookup. |
 
+| 37 | `explain_endpoint` — explain output must match the endpoint's real query | A simplified or divergent explain query could report an index plan that the real endpoint does not use, or omit required parameter validation. | Exercise all five target names, check missing/invalid parameters, and inspect real MongoDB executionStats and nested lookup plans. | **Implemented and tested.** Thirteen real-MongoDB integration tests pass. All five targets return raw explain documents; the sample-database checks found expected index use for the attendance list and analytics pipelines, with zero collection scans in the inspected lookup stages. Large-dataset validation on approximately 100,000 attendance records remains outstanding. |
+
 ## Behaviours checked but not classified as defects
 
 - `GET /` and `GET /favicon.ico` return `404`. These are not defects because the API contract does not require a root page or favicon; `/health` is the specified readiness endpoint.

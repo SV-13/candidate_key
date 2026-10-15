@@ -61,24 +61,20 @@ The concurrency script creates test records and leaves them in the database. Use
 
 ## Status
 
-**Done**
-- Employee creation and listing, including validation and pagination.
-- Punch-in and punch-out, including timestamp validation and concurrency protection.
-- Shared attendance response serialization and legacy-field defaults.
-- `GET /attendance`, including query validation, database-side pagination, stable sorting, and regression tests.
-- `PATCH /attendance/{emp_code}/{date}`, including validation, derived-field recomputation, no-op rejection, audit history, and atomic conflict protection.
-- `GET /analytics/employees/{emp_code}/monthly`, including MongoDB aggregation, mid-month joining rules, empty-month handling, and four-decimal percentage rounding.
-- `GET /analytics/departments/summary`, including cross-collection aggregation, correct headcount for employees without logs, and record-weighted work-hour averages.
-- `GET /analytics/leaderboard/late`, including competition ranking, department-specific ranking, and limit-after-ranking tie handling.
-- `GET /analytics/departments/{department}/trend`, including daily gap filling, date-dependent headcount, half-day presence, and the rolling 7-day attendance-rate average.
-- Database health checks and automated tests for implemented behavior.
+**Implemented**
+- Employee creation and listing, including validation, filtering, pagination, and sorting.
+- Punch-in and punch-out, including timestamp validation, concurrency protection, and attendance calculations.
+- `GET /attendance`, including filtering, database-side pagination, stable sorting, and response serialization.
+- `PATCH /attendance/{emp_code}/{date}`, including regularization validation, derived-field recomputation, atomic conflict protection, and audit history.
+- `GET /analytics/employees/{emp_code}/monthly`, including working-day calculations and four-decimal attendance percentage rounding.
+- `GET /analytics/departments/summary`, including cross-collection aggregation, correct headcount, and record-weighted work-hour averages.
+- `GET /analytics/leaderboard/late`, including competition ranking and tie-safe limit handling.
+- `GET /analytics/departments/{department}/trend`, including daily gap filling, date-dependent headcount, and the rolling 7-day average.
+- `/admin/explain/{endpoint}`, returning raw MongoDB explain output for the five supported query/aggregation targets.
+- Database readiness checks and regression tests. The latest full test run reported 141 passed, with one non-fatal Starlette deprecation warning.
 
-**In progress**
-- Final review of `REVIEW.md` and `DECISIONS.md` submission documentation.
-
-**Not started**
-- `/admin/explain/{endpoint}`.
-- `/admin/explain/{endpoint}`.
+**Remaining verification**
+- The explain plans have been inspected against the isolated local sample database, and expected indexes were observed in the tested query paths. Performance and plan behavior on the grader-sized dataset of approximately 100,000 attendance records have not yet been verified.
 
 ## Design notes
 

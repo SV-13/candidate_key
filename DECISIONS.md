@@ -4,7 +4,7 @@
 
 2. **Punch-in race.** Two requests can find the same employee and try to insert attendance for the same date. The unique `(emp_code, date)` index allows only one insert. The other raises `DuplicateKeyError`, which the endpoint catches and returns as `409 Conflict`. This prevents duplicate daily records even when requests arrive together.
 
-3. **Ties.** Pending until the late-arrival leaderboard is implemented.
+3. **Ties.** The late leaderboard uses MongoDB `$setWindowFields` with `$rank` over `total_late_minutes` descending, producing competition ranks such as `1, 2, 2, 4`. The optional department filter is applied before ranking so ranks are calculated within that department. The requested `limit` is applied after ranking, retaining all employees whose rank is at most the limit; consequently the response can contain more rows than the limit. Tied rows are then ordered by `emp_code` ascending.
 
 4. **Headcount.** The department summary begins with employees whose `joined_on` is on or before the month's last day, then looks up attendance records. It preserves employees with no logs and groups by employee before department to avoid counting an employee multiple times. Employees who join after the month ends are excluded.
 

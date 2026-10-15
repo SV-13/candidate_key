@@ -1359,3 +1359,96 @@ def department_summary(
         )
 
     return {"month": month, "items": items}
+
+
+# --------------------------------------------------------------------------- #
+# Analytics: late-comers leaderboard
+# --------------------------------------------------------------------------- #
+
+@app.get("/analytics/leaderboard/late")
+def late_leaderboard(
+    month: str = Query(..., pattern=r"^\d{4}-(0[1-9]|1[0-2])$"),
+    limit: int = Query(10, ge=1, le=50),
+    department: Optional[str] = None,
+):
+    """Rank employees by monthly late minutes using competition ranking."""
+    year, month_number = map(int, month.split("-"))
+    try:
+        month_start = date(year, month_number, 1)
+        if month_number == 12:
+            month_end = date(year, 12, 31)
+        else:
+            month_end = date(year, month_number + 1, 1) - timedelta(days=1)
+    except ValueError:
+        raise HTTPException(422, "month must be a valid YYYY-MM calendar month")
+
+    pipeline = [
+        {
+            "$match": {
+                "date": {
+                    "$gte": month_start.isoformat(),
+                    "$lte": month_end.isoformat(),
+                }
+            }
+        },
+        {
+            "$group": {
+                "_id": "$emp_code",
+                "total_late_minutes": {
+                    "$sum": {"$ifNull": ["$late_minutes", 0]}
+                },
+                "late_count": {
+                    "$sum": {
+                        "$cond": [
+                            {"$gt": [{"$ifNull": ["$late_minutes", 0]}, 0]},
+                            1,
+                            0,
+                        ]
+                    }
+                },
+            }
+        },
+        {
+            "$lookup": {
+                "from": "employees",
+                "localField": "_id",
+                "foreignField": "emp_code",
+                "as": "__employee",
+            }
+        },
+        # The default unwind drops records whose employee no longer exists.
+        {"$unwind": "$__employee"},
+        {
+            "$match": {
+                "total_late_minutes": {"$gt": 0},
+                **(
+                    {"__employee.department": department}
+                    if department is not None
+                    else {}
+                ),
+            }
+        },
+        {
+            "$setWindowFields": {
+                "sortBy": {"total_late_minutes": -1},
+                "output": {"rank": {"$rank": {}}},
+            }
+        },
+        # Keep all ties at the limit rank; this can return more than limit rows.
+        {"$match": {"rank": {"$lte": limit}}},
+        {"$sort": {"total_late_minutes": -1, "_id": 1}},
+        {
+            "$project": {
+                "_id": 0,
+                "rank": 1,
+                "emp_code": "$_id",
+                "name": "$__employee.name",
+                "department": "$__employee.department",
+                "total_late_minutes": 1,
+                "late_count": 1,
+            }
+        },
+    ]
+
+    items = list(db.attendance_logs.aggregate(pipeline))
+    return {"month": month, "items": items}

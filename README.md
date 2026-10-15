@@ -65,10 +65,10 @@ The concurrency script creates test records and leaves them in the database. Use
 - Employee creation and listing, including validation and pagination.
 - Punch-in and punch-out, including timestamp validation and concurrency protection.
 - Shared attendance response serialization and legacy-field defaults.
+- `GET /attendance`, including query validation, database-side pagination, stable sorting, and regression tests.
 - Database health checks and automated tests for implemented behavior.
 
 **In progress**
-- `GET /attendance`: response normalization is implemented; database-side pagination, sorting, and remaining query validation still need work.
 - `REVIEW.md` and `DECISIONS.md` submission documentation.
 
 **Not started**

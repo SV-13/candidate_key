@@ -61,6 +61,13 @@ def ensure_indexes():
         name="idx_attendance_emp_code_punch_in",
     )
 
+    db.attendance_logs.create_index(
+        [
+            ("date", DESCENDING),
+            ("emp_code", ASCENDING),
+        ],
+        name="idx_attendance_date_emp_code",
+    )
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -572,25 +579,73 @@ def list_attendance(
     emp_code: Optional[str] = None,
     date_from: Optional[str] = None,
     date_to: Optional[str] = None,
-    status: Optional[str] = None,
-    page: int = 1,
-    page_size: int = 20,
+    status: Optional[
+        Literal["PRESENT", "ABSENT", "LEAVE", "WFH", "ON_DUTY"]
+    ] = None,
+    page: int = Query(default=1, ge=1),
+    page_size: int = Query(default=20, ge=1, le=100),
 ):
-    q = {}
-    if emp_code:
-        q["emp_code"] = emp_code
-    if date_from or date_to:
-        q["date"] = {}
-        if date_from:
-            q["date"]["$gte"] = date_from
-        if date_to:
-            q["date"]["$lte"] = date_to
-    if status:
-        q["status"] = status
-    docs = list(db.attendance_logs.find(q))
-    docs.sort(key=lambda d: d["date"], reverse=True)
-    total = len(docs)
-    page_docs = docs[(page - 1) * page_size : page * page_size]
+    # Validate strict ISO calendar dates, including impossible dates.
+    def validate_date(value: Optional[str], field_name: str):
+        if value is None:
+            return None
+
+        try:
+            parsed = date.fromisoformat(value)
+        except ValueError:
+            raise HTTPException(
+                status_code=422,
+                detail=f"{field_name} must be a valid date in YYYY-MM-DD format",
+            )
+
+        if parsed.isoformat() != value:
+            raise HTTPException(
+                status_code=422,
+                detail=f"{field_name} must be in YYYY-MM-DD format",
+            )
+
+        return parsed
+
+    parsed_date_from = validate_date(date_from, "date_from")
+    parsed_date_to = validate_date(date_to, "date_to")
+
+    if (
+        parsed_date_from is not None
+        and parsed_date_to is not None
+        and parsed_date_from > parsed_date_to
+    ):
+        raise HTTPException(
+            status_code=422,
+            detail="date_from must be on or before date_to",
+        )
+
+    # Build one filter and use it for both the total and current page.
+    query = {}
+
+    if emp_code is not None:
+        query["emp_code"] = emp_code
+
+    if parsed_date_from is not None or parsed_date_to is not None:
+        query["date"] = {}
+
+        if parsed_date_from is not None:
+            query["date"]["$gte"] = parsed_date_from.isoformat()
+
+        if parsed_date_to is not None:
+            query["date"]["$lte"] = parsed_date_to.isoformat()
+
+    if status is not None:
+        query["status"] = status
+
+    total = db.attendance_logs.count_documents(query)
+
+    page_docs = list(
+        db.attendance_logs.find(query)
+        .sort([("date", DESCENDING), ("emp_code", ASCENDING)])
+        .skip((page - 1) * page_size)
+        .limit(page_size)
+    )
+
     items = [serialize_attendance(doc) for doc in page_docs]
 
     return {

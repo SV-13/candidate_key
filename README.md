@@ -70,13 +70,14 @@ The concurrency script creates test records and leaves them in the database. Use
 - `GET /analytics/employees/{emp_code}/monthly`, including MongoDB aggregation, mid-month joining rules, empty-month handling, and four-decimal percentage rounding.
 - `GET /analytics/departments/summary`, including cross-collection aggregation, correct headcount for employees without logs, and record-weighted work-hour averages.
 - `GET /analytics/leaderboard/late`, including competition ranking, department-specific ranking, and limit-after-ranking tie handling.
+- `GET /analytics/departments/{department}/trend`, including daily gap filling, date-dependent headcount, half-day presence, and the rolling 7-day attendance-rate average.
 - Database health checks and automated tests for implemented behavior.
 
 **In progress**
 - Final review of `REVIEW.md` and `DECISIONS.md` submission documentation.
 
 **Not started**
-- The remaining analytics endpoint: department trend.
+- `/admin/explain/{endpoint}`.
 - `/admin/explain/{endpoint}`.
 
 ## Design notes

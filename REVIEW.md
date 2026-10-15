@@ -42,6 +42,8 @@
 
 | 35 | `late_leaderboard` — ties, ranking limit, and employee join | Array position is not competition rank; applying the limit before ranking can drop employees tied at the boundary. Ranking must be department-specific when filtered, and orphan logs must be excluded. | Seed real MongoDB records with tied totals, compare overall and department rankings, verify limit=2 returns every rank-2 tie, and inspect executionStats. | **Implemented and verified.** Uses `$setWindowFields` with `$rank`, applies the limit after ranking, and sorts tied rows by `emp_code`. Nine real-MongoDB integration tests pass. The main query uses `idx_attendance_date_emp_code` (9 keys/documents examined on the sample); the employee lookup uses `uq_employees_emp_code` with zero lookup collection scans. |
 
+| 36 | `department_trend` — missing dates, headcount and rolling average | Dates with no attendance logs must still appear. Headcount changes with `joined_on`; half-days count as 0.5; weekend and zero-headcount rates must be null; the moving average uses only non-null rates within the requested range. | Test gap-filled series, weekday/weekend rates, mid-range joiners, the rolling window, unknown departments, reversed ranges, and the 92-day boundary. Inspect both lookup indexes. | **Implemented and verified.** Seven real-MongoDB integration tests pass. Both lookups used indexes in explain testing: `idx_employees_department_joined_on` and `idx_attendance_date_emp_code`, with zero collection scans in either lookup. |
+
 ## Behaviours checked but not classified as defects
 
 - `GET /` and `GET /favicon.ico` return `404`. These are not defects because the API contract does not require a root page or favicon; `/health` is the specified readiness endpoint.

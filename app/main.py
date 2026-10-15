@@ -114,6 +114,20 @@ def serialize_mongo_value(value):
 
     return value
 
+def serialize_attendance(doc):
+    """Normalize an attendance document for the public API."""
+    attendance = dict(doc)
+
+    # Legacy documents may not contain these fields.
+    attendance.setdefault("late_minutes", 0)
+    attendance.setdefault("overtime_minutes", 0)
+    attendance.setdefault("half_day", False)
+    attendance.setdefault("history", [])
+
+    # Recursively converts datetimes to epoch milliseconds
+    # and removes MongoDB _id fields.
+    return serialize_mongo_value(attendance)
+
 def from_epoch_ms(value: int) -> datetime:
     """Convert a strict epoch-millisecond integer to whole-second UTC."""
     if type(value) is not int:
@@ -457,18 +471,7 @@ def punch_in(body: PunchInIn):
         ) from None
 
     # 7. Return the public API representation; never expose MongoDB _id.
-    return {
-        "emp_code": doc["emp_code"],
-        "date": doc["date"],
-        "status": doc["status"],
-        "punch_in": to_epoch_ms(ts),
-        "punch_out": None,
-        "work_hours": None,
-        "late_minutes": late_minutes,
-        "overtime_minutes": 0,
-        "half_day": False,
-        "history": [],
-    }
+    return serialize_attendance(doc)
 
 @app.post("/attendance/punch-out")
 def punch_out(body: PunchOutIn):
@@ -494,22 +497,6 @@ def punch_out(body: PunchOutIn):
     )
 
     if candidate is None:
-        # Distinguish an invalid timestamp before a recorded punch-in
-        # from a complete absence of an eligible attendance record.
-        future_record = db.attendance_logs.find_one(
-            {
-                "emp_code": body.emp_code,
-                "punch_in": {"$gt": ts},
-            },
-            sort=[("punch_in", ASCENDING)],
-        )
-
-        if future_record is not None:
-            raise HTTPException(
-                422,
-                "punched_at must be after punch_in",
-            )
-
         raise HTTPException(404, "attendance record not found")
 
     # 4. Validate time before checking whether the record is closed.
@@ -578,7 +565,7 @@ def punch_out(body: PunchOutIn):
 
     # 7. Convert datetimes to epoch milliseconds and hide MongoDB _id.
     #    Punch-out deliberately does not write to history.
-    return serialize_mongo_value(updated)
+    return serialize_attendance(updated)
 
 @app.get("/attendance")
 def list_attendance(
@@ -604,14 +591,17 @@ def list_attendance(
     docs.sort(key=lambda d: d["date"], reverse=True)
     total = len(docs)
     page_docs = docs[(page - 1) * page_size : page * page_size]
-    for d in page_docs:
-        d["id"] = str(d.pop("_id"))
-    return {"items": page_docs, "total": total, "page": page, "page_size": page_size}
+    items = [serialize_attendance(doc) for doc in page_docs]
 
+    return {
+        "items": items,
+        "total": total,
+        "page": page,
+        "page_size": page_size,
+    }
 
 # --------------------------------------------------------------------------- #
 # TODO - the rest of the contract (see openapi.yaml):
-#   POST  /attendance/punch-out
 #   PATCH /attendance/{emp_code}/{date}
 #   GET   /analytics/employees/{emp_code}/monthly
 #   GET   /analytics/departments/summary

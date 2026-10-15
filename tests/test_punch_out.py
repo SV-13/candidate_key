@@ -178,6 +178,38 @@ def test_punch_out_without_attendance_record_returns_404(api):
     assert response.status_code == 404
     assert response.json()["detail"] == "attendance record not found"
 
+@pytest.mark.parametrize("punch_in_state", ["null", "missing"])
+def test_punch_out_absent_record_without_punch_in_returns_404(
+    api, punch_in_state
+):
+    client, db = api
+    add_employee(db)
+
+    absent_record = {
+        "_id": "absent-record",
+        "emp_code": "EMP0001",
+        "date": "2026-10-12",
+        "status": "ABSENT",
+        "punch_out": None,
+        "work_hours": None,
+        "late_minutes": 0,
+        "overtime_minutes": 0,
+        "half_day": False,
+        "history": [],
+    }
+
+    if punch_in_state == "null":
+        absent_record["punch_in"] = None
+
+    db.attendance_logs.documents.append(absent_record)
+
+    response = punch_out(
+        client,
+        datetime(2026, 10, 12, 10, 0, tzinfo=UTC),
+    )
+
+    assert response.status_code == 404
+    assert response.json()["detail"] == "attendance record not found"
 
 def test_punch_out_already_closed_record_returns_409(api):
     client, db = api
@@ -195,8 +227,13 @@ def test_punch_out_already_closed_record_returns_409(api):
     assert response.status_code == 409
 
 
-@pytest.mark.parametrize("seconds_before", [0, 1])
-def test_punch_out_at_or_before_punch_in_returns_422(api, seconds_before):
+@pytest.mark.parametrize(
+    ("seconds_before", "expected_status"),
+    [(0, 422), (1, 404)],
+)
+def test_punch_out_at_or_before_punch_in_follows_lookup_contract(
+    api, seconds_before, expected_status
+):
     client, db = api
     add_employee(db)
 
@@ -207,8 +244,7 @@ def test_punch_out_at_or_before_punch_in_returns_422(api, seconds_before):
         client, start - timedelta(seconds=seconds_before)
     )
 
-    assert response.status_code == 422
-
+    assert response.status_code == expected_status
 
 def test_punch_out_more_than_24_hours_after_returns_422(api):
     client, db = api
@@ -292,3 +328,76 @@ def test_punch_out_does_not_modify_history(api):
     assert response.status_code == 200
     assert response.json()["history"] == []
     assert record["history"] == []
+
+def test_punch_out_legacy_record_returns_normalized_fields(api):
+    client, db = api
+    add_employee(db)
+
+    start = datetime(2026, 10, 12, 8, 0, tzinfo=UTC)
+    record = add_attendance(db, start)
+
+    # Simulate a legacy record missing these fields.
+    record.pop("late_minutes")
+    record.pop("history")
+
+    response = punch_out(client, start + timedelta(hours=1))
+
+    assert response.status_code == 200
+
+    body = response.json()
+    assert body["late_minutes"] == 0
+    assert body["history"] == []
+    assert "id" not in body
+    assert "_id" not in body
+
+
+def test_serialize_attendance_applies_defaults_and_converts_history():
+    punch_in_at = datetime(2026, 10, 12, 8, 0, tzinfo=UTC)
+    old_punch_in = datetime(2026, 10, 12, 8, 0, tzinfo=UTC)
+    new_punch_in = datetime(2026, 10, 12, 7, 58, tzinfo=UTC)
+    history_at = datetime(2026, 10, 12, 9, 0, tzinfo=UTC)
+
+    doc = {
+        "_id": "internal-id",
+        "emp_code": "EMP0001",
+        "date": "2026-10-12",
+        "status": "PRESENT",
+        "punch_in": punch_in_at,
+        "punch_out": None,
+        "work_hours": None,
+        "history": [
+            {
+                "_id": "nested-internal-id",
+                "at": history_at,
+                "by": "admin",
+                "reason": "Corrected punch-in",
+                "changes": {
+                    "punch_in": {
+                        "from": old_punch_in,
+                        "to": new_punch_in,
+                    }
+                },
+            }
+        ],
+    }
+
+    result = main.serialize_attendance(doc)
+
+    assert result["late_minutes"] == 0
+    assert result["overtime_minutes"] == 0
+    assert result["half_day"] is False
+
+    assert "_id" not in result
+    assert "id" not in result
+    assert "_id" not in result["history"][0]
+
+    assert result["punch_in"] == main.to_epoch_ms(punch_in_at)
+    assert result["history"][0]["at"] == main.to_epoch_ms(history_at)
+    assert (
+        result["history"][0]["changes"]["punch_in"]["from"]
+        == main.to_epoch_ms(old_punch_in)
+    )
+    assert (
+        result["history"][0]["changes"]["punch_in"]["to"]
+        == main.to_epoch_ms(new_punch_in)
+    )

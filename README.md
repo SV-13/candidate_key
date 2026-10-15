@@ -1,60 +1,83 @@
-# Candidate kit
+# Employee Attendance & Analytics API
 
-Read in this order:
+A FastAPI application backed by MongoDB for employee management, attendance tracking, manual attendance corrections, and analytics.
 
-1. `PROBLEM_STATEMENT.docx`: what you are asked to do, how it is evaluated.
-2. `openapi.yaml`: the API contract and the business rules (R1 - R10).
-3. `DATA_MODEL.md`: what is stored in MongoDB, with nine sample documents.
-4. `app/main.py`: the starter. Put **all** your code in this one file. It must start with `uvicorn app.main:app --port 8000`.
-5. `REVIEW.md`, `DECISIONS.md`: templates to fill in.
+## Setup
 
-`sample_data/` holds the nine sample documents as MongoDB Extended JSON; `sample_seed.py` loads them. The grader's dataset is
-much larger and contains cases they do not show.
+Requirements: Python 3.12+, Docker, and MongoDB 6.0 or newer.
 
-## Local setup
+Start MongoDB locally:
+
 ```bash
-python -m venv .venv && source .venv/bin/activate
-pip install -r requirements.txt
-cp .env.example .env            # set MONGO_URI / MONGO_DB (local docker: docker run -p 27017:27017 mongo:7)
-python sample_seed.py
+docker run -d --name attendance-mongo -p 27017:27017 mongo:7
+```
+
+Create and activate the virtual environment, then install dependencies:
+
+```bash
+python -m venv .venv
+source .venv/bin/activate
+python -m pip install -r requirements.txt
+```
+
+Create a `.env` file in the project root with:
+
+```dotenv
+MONGO_URI=mongodb://localhost:27017
+MONGO_DB=attendance_db
+```
+
+Do not commit `.env` or other secrets.
+
+Start the API:
+
+```bash
 uvicorn app.main:app --port 8000 --reload
 ```
-MongoDB **6.0 or newer** is required (the grader uses 7.0). MongoDB Atlas free tier (M0) works.
 
-## Submit
-A public Git repository with `app/main.py`, `requirements.txt`, `REVIEW.md`, `DECISIONS.md` and a short `README.md`.
-No `.env`, no secrets, no Dockerfile.
+API documentation is available at `http://127.0.0.1:8000/docs`. Check database readiness at `http://127.0.0.1:8000/health`.
 
-## Development and testing
+## Testing
 
-Install the development and testing dependencies in your virtual environment:
+Install the test dependencies if needed:
 
 ```bash
 python -m pip install pytest httpx
 ```
 
-Run the automated test suite:
+Run the automated tests:
 
 ```bash
 pytest -q
 ```
 
-Run the real-MongoDB concurrency tests with the API and MongoDB running:
+For concurrency checks against a running API and real MongoDB:
 
 ```bash
 python scripts/race_test.py
 ```
 
-The concurrency script sends 20 simultaneous requests to each endpoint. Expected results are one `201` and nineteen `409` responses for employee creation, one `201` and nineteen `409` responses for punch-in, and one `200` and nineteen `409` responses for punch-out.
+The concurrency script creates test records and leaves them in the database. Use a development or test database.
 
-The concurrency script creates test employees and attendance records in the configured database and leaves them there. Run it against a development or test database, not production.
+## Status
 
-## Attendance implementation notes
+**Done**
+- Employee creation and listing, including validation and pagination.
+- Punch-in and punch-out, including timestamp validation and concurrency protection.
+- Shared attendance response serialization and legacy-field defaults.
+- Database health checks and automated tests for implemented behavior.
 
-API timestamps are integer epoch milliseconds. Datetimes used for storage and calculations are timezone-aware UTC instants; attendance dates and shift bounds follow IST, including overnight shifts.
+**In progress**
+- `GET /attendance`: response normalization is implemented; database-side pagination, sorting, and remaining query validation still need work.
+- `REVIEW.md` and `DECISIONS.md` submission documentation.
 
-Punch-out timestamps must be strictly later than punch-in and no more than 24 hours later. Exactly 24 hours is allowed. Invalid punch-out timestamps are validated before checking whether the attendance record is already closed, so an invalid timestamp returns `422` rather than `409`.
+**Not started**
+- `PATCH /attendance/{emp_code}/{date}`.
+- The four analytics endpoints.
+- `/admin/explain/{endpoint}`.
 
-Punch-out uses a conditional atomic MongoDB update to prevent two simultaneous requests from closing the same attendance record successfully. Punch-in and punch-out do not write to the attendance `history` field.
+## Design notes
 
-The application uses a two-second MongoDB server-selection timeout. If MongoDB or required index creation is unavailable during startup, the application can start in degraded mode; `/health` returns `503` until database readiness and required indexes are established.
+- Instants are stored as timezone-aware UTC datetimes and returned as epoch milliseconds. Attendance dates and shift calculations follow IST, including overnight shifts.
+- Punch-out selects the most recent record whose `punch_in` is at or before `punched_at`; if no record qualifies, it returns `404`, even if a future punch-in exists. The selected record is closed with a conditional atomic MongoDB update.
+- If MongoDB or required index creation is unavailable at startup, the application can start in degraded mode. `/health` returns `503` until database connectivity and required indexes are established.

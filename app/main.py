@@ -919,15 +919,6 @@ def regularize_attendance(
     return serialize_attendance(updated)
 
 
-# --------------------------------------------------------------------------- #
-# TODO - the rest of the contract (see openapi.yaml):
-#   PATCH /attendance/{emp_code}/{date}
-#   GET   /analytics/employees/{emp_code}/monthly
-#   GET   /analytics/departments/summary
-#   GET   /analytics/leaderboard/late
-#   GET   /analytics/departments/{department}/trend
-#   GET   /admin/explain/{endpoint}
-# --------------------------------------------------------------------------- #
 
 
 # --------------------------------------------------------------------------- #
@@ -1249,9 +1240,6 @@ def _build_department_summary_pipeline(employee_filter, start_text, end_text):
                     "$ne": [{"$ifNull": ["$__logs", None]}, None]
                 },
                 "__late": {"$ifNull": ["$__logs.late_minutes", 0]},
-                "__overtime": {
-                    "$ifNull": ["$__logs.overtime_minutes", 0]
-                },
                 "__is_presence": {
                     "$in": ["$__logs.status", ["PRESENT", "WFH", "ON_DUTY"]]
                 },
@@ -1386,11 +1374,6 @@ def _build_department_summary_pipeline(employee_filter, start_text, end_text):
                         ]
                     }
                 },
-                "total_overtime_minutes": {
-                    "$sum": {
-                        "$cond": ["$__has_log", "$__overtime", 0]
-                    }
-                },
                 "leave_count": {
                     "$sum": {
                         "$cond": [
@@ -1430,9 +1413,6 @@ def _build_department_summary_pipeline(employee_filter, start_text, end_text):
                 "work_hours_count": {"$sum": "$work_hours_count"},
                 "late_count": {"$sum": "$late_count"},
                 "total_late_minutes": {"$sum": "$total_late_minutes"},
-                "total_overtime_minutes": {
-                    "$sum": "$total_overtime_minutes"
-                },
                 "leave_count": {"$sum": "$leave_count"},
                 "on_duty_count": {"$sum": "$on_duty_count"},
             }

@@ -73,8 +73,8 @@ The concurrency script creates test records and leaves them in the database. Use
 - `/admin/explain/{endpoint}`, returning raw MongoDB explain output for the five supported query/aggregation targets.
 - Database readiness checks and regression tests. The latest full test run reported 141 passed, with one non-fatal Starlette deprecation warning.
 
-**Remaining verification**
-- The explain plans have been inspected against the isolated local sample database, and expected indexes were observed in the tested query paths. Performance and plan behavior on the grader-sized dataset of approximately 100,000 attendance records have not yet been verified.
+**Scale validation**
+- Explain plans were checked against a locally seeded dataset of 100,000 attendance records. All five supported targets returned HTTP 200, and expected indexes were observed in the main query and active lookup stages. No collection scans were reported in the tested lookup stages. This is a local validation, not a production benchmark.
 
 ## Design notes
 
